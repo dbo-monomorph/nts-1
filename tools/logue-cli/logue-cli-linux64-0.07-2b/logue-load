@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+
+"""
+logue-load
+
+Copyright 2021 Nathan Rosenquist
+Based on make_osc_load_sysex.pl, copyright 2020 Chris Cunningham 
+
+
+The Korg logue-cli works OK for loading smaller oscillators onto the Korg
+NTS-1. However, once they get beyond a certain size, the uploads will fail
+with a MIDI timeout. The issue is that logue-cli is using an ALSA
+sequencer port, and now an ALSA rawmidi port, and the sequencer port limits
+the length of the messages.
+
+This script provides a workaround. If you run logue-cli in -d mode, it will
+print out the MIDI SysEx payload that it is trying to upload. This script
+can turn the logue-cli output into a MIDI sysex call that will use a
+rawmidi port and complete the attempted upload.
+
+This whole thing is a reimplementation of a Perl script written by
+Chris Cunningham (aminidxuser) on Github, shared in this thread:
+https://github.com/korginc/logue-sdk/issues/37
+
+The main difference is that this script automates the upload entirely,
+calling logue-cli and amidi as necessary, without requiring any
+intermediate steps.
+
+
+
+This is a copy of the MIT open source license
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+"""
+
+import argparse
+import re
+import os
+import sys
+import subprocess
+
+PROGRAM_NAME = "logue-load"
+
+CMD_AMIDI = "amidi"
+CMD_LOGUE_CLI = "logue-cli"
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+
+def _extract_sysex(line):
+    """
+    This function extracts MIDI SysEx data from a debug line from the
+    logue-cli command.
+
+    Example input:
+    >>> { f0, 42, 30 }
+
+    Example return value:
+    f0 42 30
+
+    """
+
+    tmp = line
+    tmp = re.sub(r"^>>> { ", r"", tmp)
+    tmp = re.sub(r" }$", r"", tmp)
+    tmp = re.sub(r",", r"", tmp)
+
+    return tmp
+
+def logue_cli_load(unit, in_port, out_port, slot=None):
+    """
+    Try to load a unit file into the device using logue-cli.
+
+    Return None on success.
+
+    Return a string containing the MIDI SysEx data that should have been
+    uploaded on failure.
+
+    """
+
+    cmd_stack = []
+    cmd_stack.append(CMD_LOGUE_CLI)
+    cmd_stack.append("load")
+    cmd_stack.append("-d")
+
+    cmd_stack.append("-i")
+    cmd_stack.append(str(in_port))
+
+    cmd_stack.append("-o")
+    cmd_stack.append(str(out_port))
+    if slot is not None:
+        cmd_stack.append("-s")
+        cmd_stack.append(str(slot))
+
+    cmd_stack.append("-u")
+    cmd_stack.append(str(unit))
+
+    completed_process = subprocess.run(cmd_stack, capture_output=True)
+
+    if 0 != completed_process.returncode:
+        output_str = completed_process.stdout.decode("UTF-8")
+        found_size = False
+        for line in output_str.split("\n"):
+            if line.startswith("size: "):
+                found_size = True
+
+            if found_size:
+                if line.startswith(">>> {"):
+                    return _extract_sysex(line)
+
+        sys.stdout.write(completed_process.stdout.decode("UTF-8"))
+        sys.stderr.write(completed_process.stderr.decode("UTF-8"))
+        sys.exit(EXIT_FAIL)
+
+    return None
+
+def amidi_get_hw():
+    """
+    Run amidi -l and get the hardware string.
+
+    Returns the hardware string, but only if there is just one device that
+    could possibly match.
+
+    Prints an error and exits the program if more than one device is found.
+
+    """
+
+    cmd_stack = []
+    cmd_stack.append(CMD_AMIDI)
+    cmd_stack.append("-l")
+
+    completed_process = subprocess.run(cmd_stack, capture_output=True)
+    if 0 != completed_process.returncode:
+        raise Exception("error running `amidi -l`")
+
+    lines = completed_process.stdout.decode("UTF-8").split("\n")
+    found_device = False
+    hw = None
+    for line in lines:
+        if line.startswith("Dir "):
+            continue
+        if line.startswith("IO  "):
+            parts = re.split(r"\s+", line, maxsplit=2)
+            desc = parts[2].lower()
+            if desc.startswith("nts-1") or \
+                    desc.startswith("minilogue xd") or \
+                    desc.startswith("prologue"):
+
+                if found_device:
+                    raise Exception(
+                        "amidi found multiple eligible devices, can not disambiguate: " + \
+                        completed_process.stdout)
+
+                found_device = True
+                hw = parts[1]
+
+    return hw
+
+def amidi_sysex_upload(hw, sysex):
+    """
+    Upload the SysEx data to the device using amidi.
+
+    Returns nothing.
+
+    Prints out errors and exits the program on failure.
+
+    """
+
+    cmd_stack = []
+    cmd_stack.append(CMD_AMIDI)
+    cmd_stack.append("-p")
+    cmd_stack.append(hw)
+    cmd_stack.append("-S")
+    cmd_stack.append(sysex)
+
+    completed_process = subprocess.run(cmd_stack, capture_output=True)
+    if 0 != completed_process.returncode:
+        sys.stdout.write(completed_process.stdout.decode("UTF-8"))
+        sys.stderr.write(completed_process.stderr.decode("UTF-8"))
+        sys.exit(EXIT_FAIL)
+
+def parse_arguments(args):
+    parser = argparse.ArgumentParser(description=PROGRAM_NAME)
+
+    parser.add_argument("-u", "--unit", dest="unit", required=True, type=str)
+    parser.add_argument("-i", "--inport", dest="in_port", required=True, type=int)
+    parser.add_argument("-o", "--outport", dest="out_port", required=True, type=int)
+    parser.add_argument("-s", "--slot", dest="slot", default=None, type=int)
+
+    return parser.parse_args(args)
+
+def main():
+    # parse command-line arguments
+    args = parse_arguments(sys.argv[1:])
+
+    # try to upload the unit file to the device
+    # this will either Just Work, or fail but return the SysEx data to upload,
+    # or it will fail so badly that it will exit the program entirely
+    # (e.g. if the device is not found)
+    sysex = logue_cli_load(args.unit, args.in_port, args.out_port, args.slot)
+
+    # if we got SysEx data back, it means we weren't able to upload it yet
+    # try again with amidi
+    if sysex:
+        # find the device using amidi
+        hw = amidi_get_hw()
+
+        # if we found the device, try to upload the SysEx data
+        if hw:
+            amidi_sysex_upload(hw, sysex)
+        else:
+            sys.stderr.write("no device found by amidi\n")
+            sys.exit(EXIT_FAIL)
+
+    sys.exit(EXIT_OK)
+
+if __name__ == "__main__":
+    main()
